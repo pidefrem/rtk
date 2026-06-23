@@ -1,0 +1,41 @@
+# Local git hooks for rtk. Mirrors the project's CI gate (.github/workflows/ci.yml)
+# so problems surface before push, not in CI.
+#
+#   commit : fast checks only — formatting (sub-second)
+#   push   : clippy + tests (the heavier half of the CI gate)
+#
+# CI remains the source of truth; these hooks are a convenience that catch the
+# common failures locally. Install with:  pre-commit install && pre-commit install --hook-type pre-push
+#
+# Entries assume cargo/rustfmt are on PATH (rustup's default via your shell profile),
+# matching astral-sh/uv's pre-commit config. If you run git from an environment that
+# doesn't load your profile, either ensure ~/.cargo/bin is on PATH or use --no-verify.
+fail_fast: true
+
+repos:
+  - repo: local
+    hooks:
+      # Format on commit — matches CI's `cargo fmt --all -- --check`, but auto-fixes.
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # Heavier checks run on push only — match CI exactly.
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --all
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
