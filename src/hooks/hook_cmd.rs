@@ -69,7 +69,13 @@ pub fn run_copilot() -> Result<()> {
 fn detect_format(v: &Value) -> HookFormat {
     // VS Code Copilot Chat / Claude Code: snake_case keys
     if let Some(tool_name) = v.get("tool_name").and_then(|t| t.as_str()) {
-        if matches!(tool_name, "runTerminalCommand" | "Bash" | "bash") {
+        // VS Code ships the terminal tool under two names: `runTerminalCommand`
+        // (older) and `run_in_terminal` (current). Accept both so the hook fires
+        // regardless of the extension-host version. See issue #1425.
+        if matches!(
+            tool_name,
+            "runTerminalCommand" | "run_in_terminal" | "Bash" | "bash"
+        ) {
             if let Some(cmd) = v
                 .pointer("/tool_input/command")
                 .and_then(|c| c.as_str())
@@ -696,6 +702,17 @@ mod tests {
             detect_format(&vscode_input("runTerminalCommand", "cargo test")),
             HookFormat::VsCode { .. }
         ));
+    }
+
+    #[test]
+    fn test_detect_vscode_run_in_terminal() {
+        // VS Code's current terminal tool name (snake_case). Issue #1425: the hook
+        // no-opped because only runTerminalCommand was recognized.
+        let v = vscode_input("run_in_terminal", "git status");
+        match detect_format(&v) {
+            HookFormat::VsCode { command } => assert_eq!(command, "git status"),
+            _ => panic!("run_in_terminal should be detected as VsCode"),
+        }
     }
 
     #[test]
