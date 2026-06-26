@@ -764,11 +764,40 @@ impl CaptureResult {
 
 pub fn exec_capture(cmd: &mut Command) -> Result<CaptureResult> {
     cmd.stdin(Stdio::null());
-    let output = cmd.output().context("Failed to execute command")?;
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    // RAII so a `?` below still reaps the child rather than leaking a zombie.
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            self.0.wait().ok();
+        }
+    }
+    let mut child = ChildGuard(cmd.spawn().context("Failed to execute command")?);
+
+    let stdout_pipe = child.0.stdout.take().context("No child stdout handle")?;
+    let stderr_pipe = child.0.stderr.take().context("No child stderr handle")?;
+
+    // Read both pipes on background threads into shared buffers. A descendant that
+    // inherited the pipe (e.g. an `esbuild --service` grandchild) keeps the write-end
+    // open after the direct child exits, so reading to EOF on this thread — what plain
+    // `cmd.output()` does — would block forever. Adopted from #2322's exec_capture half.
+    let (done_tx, done_rx) = mpsc::channel();
+    let stdout_buf = spawn_capture_reader(stdout_pipe, "stdout", done_tx.clone());
+    let stderr_buf = spawn_capture_reader(stderr_pipe, "stderr", done_tx);
+
+    let status = child.0.wait().context("Failed to wait for command")?;
+    // Child exited: bounded-drain whatever the readers already buffered, then return even
+    // if a detached descendant still holds the pipe open (see drain_capture_readers).
+    drain_capture_readers(&done_rx, &stdout_buf, &stderr_buf);
+
+    let stdout = std::mem::take(&mut *stdout_buf.lock().expect("capture buffer lock poisoned"));
+    let stderr = std::mem::take(&mut *stderr_buf.lock().expect("capture buffer lock poisoned"));
     Ok(CaptureResult {
-        stdout: collapse_terminal_control(&String::from_utf8_lossy(&output.stdout)),
-        stderr: collapse_terminal_control(&String::from_utf8_lossy(&output.stderr)),
-        exit_code: status_to_exit_code(output.status),
+        stdout: collapse_terminal_control(&stdout),
+        stderr: collapse_terminal_control(&stderr),
+        exit_code: status_to_exit_code(status),
     })
 }
 
@@ -1535,6 +1564,40 @@ pub(crate) mod tests {
             result.raw_stdout.contains("keep_me"),
             "stdout: {:?}",
             result.raw_stdout
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_exec_capture_returns_when_grandchild_holds_pipe() {
+        // The buffered capture path (git/docker/wget/dotnet/ccusage all use exec_capture)
+        // must bound the post-exit drain too: a `sleep 2` grandchild inherits the pipe and
+        // outlives the direct child, so a plain `cmd.output()` would block until the pipe
+        // EOFs ~2s later. Adopted from #2322's exec_capture half (the author fixed both
+        // sites); our re-derived branch had only fixed run_streaming.
+        // nosemgrep: interpreter-execution
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "(sleep 2) & echo out_msg; echo err_msg >&2; exit 0"]);
+
+        let start = Instant::now();
+        let result = exec_capture(&mut cmd).unwrap();
+
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "exec_capture must return after the direct child exits, not wait for the \
+             grandchild to close the pipe (took {:?})",
+            start.elapsed()
+        );
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.stdout.contains("out_msg"),
+            "stdout: {:?}",
+            result.stdout
+        );
+        assert!(
+            result.stderr.contains("err_msg"),
+            "stderr: {:?}",
+            result.stderr
         );
     }
 
