@@ -241,12 +241,46 @@ pub fn status_to_exit_code(status: std::process::ExitStatus) -> i32 {
     1
 }
 
-/// Collapse common single-line terminal redraw controls before filters parse output.
+/// Collapse single-line terminal redraw controls to the final rendered text before
+/// filters parse output. Models a one-line cursor: `\r` returns to column 0, `\b` moves
+/// left, printable chars overlay at the cursor, `\n` commits the line.
+///
+/// CSI escape sequences (`ESC [ … final`) are parsed as a *unit* — this is the fix for the
+/// real defect: erase-in-line (`ESC [ K`) is honored against the cursor, so a *shrinking*
+/// redraw (`\r` + erase, the way programs clean up a longer previous frame) resolves
+/// correctly instead of leaving a stale tail or leaking the literal escape bytes. A bare
+/// `\r` overlay alone cannot express that erase, which is why the previous frame's tail
+/// survived before this fix.
+///
+/// Every *other* CSI sequence (SGR colour, cursor motion) is overlaid through the SAME
+/// write path as printable text — collapse does not strip colour (that is `strip_ansi`'s
+/// separate, config-gated job), and a later `\r` redraw overwrites prior escape bytes cell
+/// for cell rather than shifting them, so a same-or-longer coloured redraw resolves cleanly.
+///
+/// Scope boundary: this models the *cursor*, not per-cell colour *attributes*. So a
+/// genuinely *shorter* coloured frame overlaying a longer one can leave a trailing reset
+/// (`ESC[0m`) from the prior frame in the collapsed bytes — harmless, and `strip_ansi`
+/// removes it downstream where it matters. Tracking that would require a full VT attribute
+/// model, which is out of scope (rtk is not a terminal emulator).
 fn collapse_terminal_control(text: &str) -> String {
     let mut visible = String::new();
     let mut line: Vec<char> = Vec::new();
     let mut cursor = 0usize;
     let mut chars = text.chars().peekable();
+
+    // Overlay one char at the cursor (shared by printable chars and re-emitted escapes),
+    // padding with spaces if the cursor was advanced past the current end (e.g. post-erase).
+    let overlay = |line: &mut Vec<char>, cursor: &mut usize, ch: char| {
+        while line.len() < *cursor {
+            line.push(' ');
+        }
+        if *cursor < line.len() {
+            line[*cursor] = ch;
+        } else {
+            line.push(ch);
+        }
+        *cursor += 1;
+    };
 
     while let Some(ch) = chars.next() {
         match ch {
@@ -267,13 +301,49 @@ fn collapse_terminal_control(text: &str) -> String {
             '\u{8}' => {
                 cursor = cursor.saturating_sub(1);
             }
-            ch => {
-                if cursor < line.len() {
-                    line[cursor] = ch;
-                } else {
-                    line.push(ch);
+            '\u{1b}' => {
+                // Escape. Parse a CSI sequence (ESC '[' params… final) as a unit. A CSI
+                // final byte is 0x40–0x7E; bytes before it are parameter/intermediate bytes.
+                if chars.peek() == Some(&'[') {
+                    chars.next(); // consume '['
+                    let mut params = String::new();
+                    let final_byte = loop {
+                        match chars.next() {
+                            Some(c) if ('\u{40}'..='\u{7e}').contains(&c) => break Some(c),
+                            Some(c) => params.push(c),
+                            None => break None, // truncated sequence at EOF
+                        }
+                    };
+                    match final_byte {
+                        // Erase-in-line — the operation collapse exists to honor.
+                        Some('K') => match params.as_str() {
+                            "" | "0" => line.truncate(cursor), // cursor → end of line
+                            "1" => {
+                                for cell in line.iter_mut().take(cursor + 1) {
+                                    *cell = ' '; // start of line → cursor
+                                }
+                            }
+                            "2" => line.clear(), // whole line
+                            _ => line.truncate(cursor),
+                        },
+                        // Any other CSI: overlay the sequence verbatim through the SAME write
+                        // path as printable text, so colour passes through unchanged (prior
+                        // contract) and a later `\r` redraw overwrites it rather than shifting.
+                        Some(fb) => {
+                            overlay(&mut line, &mut cursor, '\u{1b}');
+                            overlay(&mut line, &mut cursor, '[');
+                            for c in params.chars() {
+                                overlay(&mut line, &mut cursor, c);
+                            }
+                            overlay(&mut line, &mut cursor, fb);
+                        }
+                        None => {} // truncated at EOF — drop
+                    }
                 }
-                cursor += 1;
+                // A lone ESC (not a CSI) is dropped — zero-width control data.
+            }
+            ch => {
+                overlay(&mut line, &mut cursor, ch);
             }
         }
     }
@@ -856,6 +926,86 @@ pub(crate) mod tests {
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::CaptureOnly).unwrap();
         assert_eq!(result.raw_stdout, "step 2\n");
         assert_eq!(result.filtered, "step 2\n");
+    }
+
+    // ── collapse_terminal_control: terminal-faithful redraw resolution ────────────
+    // Ground truth = what a real VT100-ish terminal renders. A bare `\r` moves the
+    // cursor to column 0 but does NOT clear the line, so a shorter frame overlaying a
+    // longer one leaves the old tail (this is faithful, not a bug). Programs that want a
+    // clean shrink emit `\r` + ESC[K (erase to end of line) or pad with spaces.
+
+    #[test]
+    fn test_collapse_bare_cr_overlay_is_faithful() {
+        // No clear: `Done` overlays `Down`, tail `loading 100%` survives — exactly what a
+        // real terminal shows for a bare `\r` with no erase. Must NOT be "fixed" away.
+        assert_eq!(
+            collapse_terminal_control("Downloading 100%\rDone\n"),
+            "Doneloading 100%\n"
+        );
+    }
+
+    #[test]
+    fn test_collapse_progress_bar_keeps_final() {
+        assert_eq!(
+            collapse_terminal_control("Building 10%\rBuilding 60%\rBuilding 100%\n"),
+            "Building 100%\n"
+        );
+    }
+
+    #[test]
+    fn test_collapse_backspace_overwrites() {
+        assert_eq!(collapse_terminal_control("abc\u{8}D\n"), "abD\n");
+    }
+
+    #[test]
+    fn test_collapse_plain_and_crlf_unchanged() {
+        assert_eq!(
+            collapse_terminal_control("line1\nline2\nline3\n"),
+            "line1\nline2\nline3\n"
+        );
+        assert_eq!(collapse_terminal_control("a\r\nb\r\n"), "a\nb\n");
+    }
+
+    // ── The bug: ESC[K (erase to end of line) is not honored ──────────────────────
+    // Real shrinking redraws use `\r` + ESC[K. #2581's collapse has no ANSI awareness,
+    // so it (a) leaks the literal escape into output and (b) leaves the stale tail.
+    // These tests pin the terminal-correct result and FAIL until ESC[K is handled.
+
+    #[test]
+    fn test_collapse_cr_then_erase_to_eol_clears_tail() {
+        // `Downloading 100%` then `\r`, erase-to-EOL, `Done` → terminal shows `Done`.
+        assert_eq!(
+            collapse_terminal_control("Downloading 100%\r\x1b[KDone\n"),
+            "Done\n"
+        );
+    }
+
+    #[test]
+    fn test_collapse_erase_to_eol_midline() {
+        // `abcdef`, `\r`, write `XY`, erase-to-EOL → `XY` (tail `cdef` cleared, no escape leak).
+        assert_eq!(collapse_terminal_control("abcdef\rXY\x1b[K\n"), "XY\n");
+    }
+
+    #[test]
+    fn test_collapse_preserves_sgr_color() {
+        // SGR colour is NOT collapse's concern — the pipe capture path passed colour
+        // through to the command filters (which strip it themselves where needed), so
+        // collapse must not start stripping it. Only erase-in-line (ESC[K) is intercepted.
+        assert_eq!(
+            collapse_terminal_control("\x1b[32mPASS\x1b[0m\n"),
+            "\x1b[32mPASS\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn test_collapse_colored_progress_redraw_keeps_final_with_color() {
+        // A coloured progress line redrawn via `\r`: the final frame (with its colour
+        // codes) survives, earlier frames collapse away. Pins that re-emitted CSI bytes
+        // participate in overlay/redraw like normal cells, not a one-way shift.
+        assert_eq!(
+            collapse_terminal_control("\x1b[33m50%\x1b[0m\r\x1b[32m100%\x1b[0m\n"),
+            "\x1b[32m100%\x1b[0m\n"
+        );
     }
 
     #[test]
