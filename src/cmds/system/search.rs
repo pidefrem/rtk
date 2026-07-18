@@ -15,11 +15,23 @@ use regex::Regex;
 use std::collections::HashMap;
 
 /// Short single-char flags that consume one following token (or inline remainder)
-/// as their value. `-e` is handled separately — its value goes to `patterns`.
-/// Includes all rg short flags that take a value argument except `-e` and `-r`
-/// (stripped) and `-E` (dialect, left to #2138). Failure mode for a missing
-/// entry: the value becomes a positional (visible wrong result, not silent).
+/// as their value, **for both engines**. `-e` is handled separately — its value
+/// goes to `patterns`. `-r`/`-E` are NOT here: they are engine-specific (see
+/// `Engine::value_flags_short`) because grep and rg disagree on whether they take
+/// a value. Failure mode for a missing entry: the value becomes a positional
+/// (visible wrong result, not silent).
 const VALUE_FLAGS_SHORT: &[u8] = b"ABCMTdfgjmt";
+
+/// Engine-specific value-taking short flags, appended to `VALUE_FLAGS_SHORT`.
+///
+/// grep and rg reuse the same letters for flags of a different arity:
+///   - `-r`: grep recursive (boolean) vs rg `--replace REPLACEMENT` (value-taking)
+///   - `-E`: grep extended-regexp (boolean) vs rg `--encoding ENCODING` (value-taking)
+///
+/// So on the rg path these MUST consume their value (`rtk rg -r REPL world` →
+/// replace matches with `REPL`, `world` is the pattern — matching native rg);
+/// on the grep path they stay boolean and pass through to real grep. See #2253.
+const VALUE_FLAGS_SHORT_RG_EXTRA: &[u8] = b"rE";
 
 /// Long flags that consume the NEXT token as their value (space-separated form).
 /// Inline `=` form (`--flag=value`) is one token and passes through unchanged.
@@ -77,18 +89,20 @@ enum ClusterResult {
 
 /// Parse the content of a short flag cluster (everything after the leading `-`).
 ///
-/// Scans left-to-right, accumulating boolean flag letters — including `r`/`R`,
-/// which pass through to grep (recursion is the agent's choice, not RTK's) — and
-/// stops at the first value-taking flag (from `VALUE_FLAGS_SHORT` or `e`).
-/// Everything after that flag char is its inline value, returned verbatim.
-fn parse_cluster(rest: &str) -> ClusterResult {
+/// Scans left-to-right, accumulating boolean flag letters — including `r`/`R` on
+/// the grep path, which pass through to grep (recursion is the agent's choice, not
+/// RTK's) — and stops at the first value-taking flag (from `VALUE_FLAGS_SHORT`,
+/// `e`, or `value_flags_extra`). Everything after that flag char is its inline
+/// value, returned verbatim. `value_flags_extra` is engine-specific (`b"rE"` for
+/// rg, empty for grep) so `-r`/`-E` consume their value on the rg path (#2253).
+fn parse_cluster(rest: &str, value_flags_extra: &[u8]) -> ClusterResult {
     let bytes = rest.as_bytes();
     let mut raw_prefix = String::new();
     let mut j = 0;
     while j < bytes.len() {
         let ch = bytes[j];
         let is_e = ch == b'e';
-        if is_e || VALUE_FLAGS_SHORT.contains(&ch) {
+        if is_e || VALUE_FLAGS_SHORT.contains(&ch) || value_flags_extra.contains(&ch) {
             let inline = std::str::from_utf8(&bytes[j + 1..])
                 .unwrap_or("")
                 .to_string();
@@ -131,13 +145,17 @@ fn match_block(path: &str, entries: &[(usize, bool, String)]) -> String {
 ///
 /// - `patterns`: positional pattern + all `-e`/`--regexp` values. Empty → error.
 /// - `paths`: subsequent non-flag positionals. Empty → caller defaults to `["."]`.
-/// - `flags`: other flags forwarded to rg (`-r`/`-R`/`--recursive` stripped).
+/// - `flags`: other flags forwarded to the engine verbatim.
 ///
 /// Short clusters are scanned left-to-right; the first value-taking letter
 /// terminates the cluster — everything after it is its inline value, not a
 /// separate flag. Long value-taking flags consume the next token. `--` marks
-/// everything after it as positional.
-fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>, Vec<String>) {
+/// everything after it as positional. `value_flags_extra` is the engine's extra
+/// value-taking short flags (`b"rE"` for rg, empty for grep) — see #2253.
+fn extract_pattern_path<T: AsRef<str>>(
+    args: &[T],
+    value_flags_extra: &[u8],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut e_patterns: Vec<String> = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
     let mut flags: Vec<String> = Vec::new();
@@ -187,7 +205,7 @@ fn extract_pattern_path<T: AsRef<str>>(args: &[T]) -> (Vec<String>, Vec<String>,
         }
 
         match arg.strip_prefix('-') {
-            Some(rest) if !rest.is_empty() => match parse_cluster(rest) {
+            Some(rest) if !rest.is_empty() => match parse_cluster(rest, value_flags_extra) {
                 ClusterResult::Boolean(prefix) => {
                     if let Some(s) = prefix {
                         flags.push(format!("-{}", s));
@@ -277,6 +295,17 @@ impl Engine {
 
     pub fn label(self) -> &'static str {
         self.bin()
+    }
+
+    /// Extra value-taking short flags this engine's parser must recognize, on top
+    /// of `VALUE_FLAGS_SHORT`. rg reads `-r`/`-E` as `--replace`/`--encoding`
+    /// (value-taking); grep reads them as boolean recursive/ERE — so only rg adds
+    /// them. See #2253.
+    fn value_flags_short_extra(self) -> &'static [u8] {
+        match self {
+            Engine::Grep => b"",
+            Engine::Rg => VALUE_FLAGS_SHORT_RG_EXTRA,
+        }
     }
 
     /// `-n -H --null` are parse aids (NUL keeps the regroup unambiguous, #1436);
@@ -385,7 +414,8 @@ pub fn run(
     let real_cmd = format!("{} {}", engine.label(), args.join(" "));
     let rtk_label = format!("rtk {}", engine.label());
 
-    let (patterns, paths, extra_args) = extract_pattern_path(&args);
+    let (patterns, paths, extra_args) =
+        extract_pattern_path(&args, engine.value_flags_short_extra());
 
     if patterns.is_empty() {
         return passthrough(&timer, engine, &args, &real_cmd);
@@ -763,31 +793,31 @@ mod tests {
     fn test_parse_cluster_boolean_only() {
         // Pure boolean clusters: r/R kept and passed through to grep
         assert_eq!(
-            parse_cluster("r"),
+            parse_cluster("r", b""),
             ClusterResult::Boolean(Some("r".to_string()))
         );
         assert_eq!(
-            parse_cluster("R"),
+            parse_cluster("R", b""),
             ClusterResult::Boolean(Some("R".to_string()))
         );
         assert_eq!(
-            parse_cluster("rR"),
+            parse_cluster("rR", b""),
             ClusterResult::Boolean(Some("rR".to_string()))
         );
         assert_eq!(
-            parse_cluster("rn"),
+            parse_cluster("rn", b""),
             ClusterResult::Boolean(Some("rn".to_string()))
         );
         assert_eq!(
-            parse_cluster("Rni"),
+            parse_cluster("Rni", b""),
             ClusterResult::Boolean(Some("Rni".to_string()))
         );
         assert_eq!(
-            parse_cluster("n"),
+            parse_cluster("n", b""),
             ClusterResult::Boolean(Some("n".to_string()))
         );
         assert_eq!(
-            parse_cluster("ni"),
+            parse_cluster("ni", b""),
             ClusterResult::Boolean(Some("ni".to_string()))
         );
     }
@@ -795,20 +825,20 @@ mod tests {
     #[test]
     fn test_parse_cluster_e_no_inline() {
         // -e: value-taking, empty inline → caller consumes next token
-        assert_eq!(parse_cluster("e"), vt(None, 'e', ""));
+        assert_eq!(parse_cluster("e", b""), vt(None, 'e', ""));
     }
 
     #[test]
     fn test_parse_cluster_e_inline_value() {
         // -ecarrot: inline="carrot" — no r/R stripping on the value bytes
-        assert_eq!(parse_cluster("ecarrot"), vt(None, 'e', "carrot"));
+        assert_eq!(parse_cluster("ecarrot", b""), vt(None, 'e', "carrot"));
     }
 
     #[test]
     fn test_parse_cluster_e_inline_value_no_rstrip() {
         // The 'r' chars in "carrot" must survive verbatim in the inline field.
         // If strip_r were called on inline bytes, this would return "caot".
-        let ClusterResult::ValueTaking { inline, .. } = parse_cluster("ecarrot") else {
+        let ClusterResult::ValueTaking { inline, .. } = parse_cluster("ecarrot", b"") else {
             panic!("expected ValueTaking");
         };
         assert_eq!(inline, "carrot");
@@ -817,8 +847,8 @@ mod tests {
     #[test]
     fn test_parse_cluster_g_inline_glob() {
         // -g*.rs: inline="*.rs" — 'r' in "*.rs" must not be stripped
-        assert_eq!(parse_cluster("g*.rs"), vt(None, 'g', "*.rs"));
-        let ClusterResult::ValueTaking { inline, .. } = parse_cluster("g*.rs") else {
+        assert_eq!(parse_cluster("g*.rs", b""), vt(None, 'g', "*.rs"));
+        let ClusterResult::ValueTaking { inline, .. } = parse_cluster("g*.rs", b"") else {
             panic!("expected ValueTaking");
         };
         assert_eq!(inline, "*.rs");
@@ -827,44 +857,44 @@ mod tests {
     #[test]
     fn test_parse_cluster_rne() {
         // r/R pass through; e is value-taking (empty inline)
-        assert_eq!(parse_cluster("rne"), vt(Some("rn"), 'e', ""));
+        assert_eq!(parse_cluster("rne", b""), vt(Some("rn"), 'e', ""));
     }
 
     #[test]
     fn test_parse_cluster_r_a() {
         // r passes through in the prefix; A is value-taking
-        assert_eq!(parse_cluster("rA"), vt(Some("r"), 'A', ""));
+        assert_eq!(parse_cluster("rA", b""), vt(Some("r"), 'A', ""));
     }
 
     #[test]
     fn test_parse_cluster_ni_a() {
         // -niA: n and i boolean, A value-taking
-        assert_eq!(parse_cluster("niA"), vt(Some("ni"), 'A', ""));
+        assert_eq!(parse_cluster("niA", b""), vt(Some("ni"), 'A', ""));
     }
 
     #[test]
     fn test_parse_cluster_ai_inline() {
         // -Ai: A value-taking, inline="i" (the 'i' is A's value, not a separate flag)
-        assert_eq!(parse_cluster("Ai"), vt(None, 'A', "i"));
+        assert_eq!(parse_cluster("Ai", b""), vt(None, 'A', "i"));
     }
 
     #[test]
     fn test_parse_cluster_short_type() {
-        assert_eq!(parse_cluster("t"), vt(None, 't', ""));
-        assert_eq!(parse_cluster("tpy"), vt(None, 't', "py")); // inline type name
+        assert_eq!(parse_cluster("t", b""), vt(None, 't', ""));
+        assert_eq!(parse_cluster("tpy", b""), vt(None, 't', "py")); // inline type name
     }
 
     #[test]
     fn test_parse_cluster_short_max_columns() {
-        assert_eq!(parse_cluster("M"), vt(None, 'M', ""));
-        assert_eq!(parse_cluster("M120"), vt(None, 'M', "120"));
+        assert_eq!(parse_cluster("M", b""), vt(None, 'M', ""));
+        assert_eq!(parse_cluster("M120", b""), vt(None, 'M', "120"));
     }
 
     // --- extract_pattern_path ---
 
     #[test]
     fn test_extract_simple() {
-        let (patterns, paths, flags) = extract_pattern_path(&["foo", "src/"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["foo", "src/"], b"");
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src/"]);
         assert!(flags.is_empty());
@@ -872,7 +902,7 @@ mod tests {
 
     #[test]
     fn test_extract_with_bool_flag() {
-        let (patterns, paths, flags) = extract_pattern_path(&["-i", "foo", "src/"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["-i", "foo", "src/"], b"");
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src/"]);
         assert_eq!(flags, vec!["-i"]);
@@ -881,7 +911,7 @@ mod tests {
     #[test]
     fn test_extract_value_taking_flag() {
         // -A 2 must not steal "error" as its value
-        let (patterns, paths, flags) = extract_pattern_path(&["-A", "2", "error", "src"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["-A", "2", "error", "src"], b"");
         assert_eq!(patterns, vec!["error"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-A", "2"]);
@@ -890,8 +920,63 @@ mod tests {
     #[test]
     fn test_extract_cluster_keeps_r() {
         // -rn: r kept, passed straight to grep
-        let (patterns, paths, flags) = extract_pattern_path(&["-rn", "foo", "src"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["-rn", "foo", "src"], b"");
         assert_eq!(patterns, vec!["foo"]);
+        assert_eq!(paths, vec!["src"]);
+        assert_eq!(flags, vec!["-rn"]);
+    }
+
+    // --- engine-aware short -r/-E (#2253): rg treats them as value-taking ---
+
+    #[test]
+    fn test_rg_short_r_is_value_taking() {
+        // rtk rg -r REPL world file: on the rg path, `-r` is --replace (takes REPL),
+        // `world` is the pattern, `file` is the path. Regression: with grep
+        // semantics `-r` was boolean, REPL became the pattern, world/file paths.
+        let (patterns, paths, flags) = extract_pattern_path(
+            &["-r", "REPL", "world", "file"],
+            VALUE_FLAGS_SHORT_RG_EXTRA,
+        );
+        assert_eq!(patterns, vec!["world"]);
+        assert_eq!(paths, vec!["file"]);
+        assert_eq!(flags, vec!["-r", "REPL"]);
+    }
+
+    #[test]
+    fn test_rg_short_e_is_value_taking() {
+        // rtk rg -E utf-8 world: `-E` is --encoding (takes utf-8), `world` the pattern.
+        let (patterns, paths, flags) =
+            extract_pattern_path(&["-E", "utf-8", "world"], VALUE_FLAGS_SHORT_RG_EXTRA);
+        assert_eq!(patterns, vec!["world"]);
+        assert!(paths.is_empty());
+        assert_eq!(flags, vec!["-E", "utf-8"]);
+    }
+
+    #[test]
+    fn test_rg_short_r_inline_value() {
+        // -rREPL: r hits at j=0, inline="REPL" (the replacement). Pattern is next token.
+        let (patterns, _, flags) =
+            extract_pattern_path(&["-rREPL", "world", "file"], VALUE_FLAGS_SHORT_RG_EXTRA);
+        assert_eq!(patterns, vec!["world"]);
+        assert_eq!(flags, vec!["-r", "REPL"]);
+    }
+
+    #[test]
+    fn test_grep_short_r_stays_boolean() {
+        // Regression guard: the SAME args on the grep path (empty extra set) keep
+        // grep semantics — `-r` is recursive (boolean), `REPL` is the pattern.
+        let (patterns, paths, flags) = extract_pattern_path(&["-r", "REPL", "world", "file"], b"");
+        assert_eq!(patterns, vec!["REPL"]);
+        assert_eq!(paths, vec!["world", "file"]);
+        assert_eq!(flags, vec!["-r"]);
+    }
+
+    #[test]
+    fn test_grep_cluster_rn_unchanged_by_fix() {
+        // The canonical grep muscle-memory `-rn PATTERN` is unaffected: r/n both
+        // boolean, PATTERN is the pattern (real grep recurses). Pins no regression.
+        let (patterns, paths, flags) = extract_pattern_path(&["-rn", "def", "src"], b"");
+        assert_eq!(patterns, vec!["def"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-rn"]);
     }
@@ -899,7 +984,7 @@ mod tests {
     #[test]
     fn test_extract_cluster_ending_in_e() {
         // -rne PATTERN: rn kept, e consumes PATTERN as the pattern
-        let (patterns, paths, flags) = extract_pattern_path(&["-rne", "PATTERN", "src"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["-rne", "PATTERN", "src"], b"");
         assert_eq!(patterns, vec!["PATTERN"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-rn"]);
@@ -908,7 +993,7 @@ mod tests {
     #[test]
     fn test_extract_cluster_ending_in_value_flag() {
         // -rA 2: r kept as its own flag, A consumes 2 as context value
-        let (patterns, paths, flags) = extract_pattern_path(&["-rA", "2", "foo", "src"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["-rA", "2", "foo", "src"], b"");
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-r", "-A", "2"]);
@@ -916,7 +1001,7 @@ mod tests {
 
     #[test]
     fn test_extract_multi_path() {
-        let (patterns, paths, flags) = extract_pattern_path(&["TODO", "src", "tests"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["TODO", "src", "tests"], b"");
         assert_eq!(patterns, vec!["TODO"]);
         assert_eq!(paths, vec!["src", "tests"]);
         assert!(flags.is_empty());
@@ -925,7 +1010,7 @@ mod tests {
     #[test]
     fn test_extract_glob_value() {
         // -g '*.md' must not steal "agent" as its value
-        let (patterns, paths, flags) = extract_pattern_path(&["-i", "x", "agent", "-g", "*.md"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["-i", "x", "agent", "-g", "*.md"], b"");
         assert_eq!(patterns, vec!["x"]);
         assert_eq!(paths, vec!["agent"]);
         assert_eq!(flags, vec!["-i", "-g", "*.md"]);
@@ -933,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_extract_e_flag() {
-        let (patterns, paths, flags) = extract_pattern_path(&["-e", "fn run", "src"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["-e", "fn run", "src"], b"");
         assert_eq!(patterns, vec!["fn run"]);
         assert_eq!(paths, vec!["src"]);
         assert!(flags.is_empty());
@@ -941,7 +1026,7 @@ mod tests {
 
     #[test]
     fn test_extract_multi_e() {
-        let (patterns, paths, flags) = extract_pattern_path(&["-e", "foo", "-e", "bar", "src"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["-e", "foo", "-e", "bar", "src"], b"");
         assert_eq!(patterns, vec!["foo", "bar"]);
         assert_eq!(paths, vec!["src"]);
         assert!(flags.is_empty());
@@ -950,7 +1035,7 @@ mod tests {
     #[test]
     fn test_extract_dashdash_boundary() {
         // After --, args are positional even if they look like flags
-        let (patterns, paths, flags) = extract_pattern_path(&["--", "--version"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["--", "--version"], b"");
         assert_eq!(patterns, vec!["--version"]);
         assert!(paths.is_empty());
         assert!(flags.is_empty());
@@ -958,7 +1043,7 @@ mod tests {
 
     #[test]
     fn test_extract_no_args() {
-        let (patterns, paths, flags) = extract_pattern_path::<&str>(&[]);
+        let (patterns, paths, flags) = extract_pattern_path::<&str>(&[], b"");
         assert!(patterns.is_empty());
         assert!(paths.is_empty());
         assert!(flags.is_empty());
@@ -967,7 +1052,7 @@ mod tests {
     #[test]
     fn test_extract_default_path_empty() {
         // Caller is responsible for defaulting empty paths to ["."]
-        let (patterns, paths, _) = extract_pattern_path(&["foo"]);
+        let (patterns, paths, _) = extract_pattern_path(&["foo"], b"");
         assert_eq!(patterns, vec!["foo"]);
         assert!(paths.is_empty());
     }
@@ -975,7 +1060,7 @@ mod tests {
     #[test]
     fn test_extract_ending_e() {
         let (patterns, paths, flags) =
-            extract_pattern_path(&["-e", "foo", "-e", "bar", "src", "-e"]);
+            extract_pattern_path(&["-e", "foo", "-e", "bar", "src", "-e"], b"");
         assert_eq!(patterns, vec!["foo", "bar"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-e"]);
@@ -986,7 +1071,7 @@ mod tests {
     #[test]
     fn test_extract_inline_e_value() {
         // -ecarrot: e hits at j=0, inline="carrot", no r-stripping on value
-        let (patterns, paths, flags) = extract_pattern_path(&["-ecarrot", "file"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["-ecarrot", "file"], b"");
         assert_eq!(patterns, vec!["carrot"]);
         assert_eq!(paths, vec!["file"]);
         assert!(flags.is_empty());
@@ -995,7 +1080,7 @@ mod tests {
     #[test]
     fn test_extract_inline_e_value_no_rstrip() {
         // -ecarrot: the 'r' in "carrot" must NOT be stripped (it's value, not a flag)
-        let (patterns, _, _) = extract_pattern_path(&["-ecarrot", "file"]);
+        let (patterns, _, _) = extract_pattern_path(&["-ecarrot", "file"], b"");
         assert_eq!(
             patterns,
             vec!["carrot"],
@@ -1006,7 +1091,7 @@ mod tests {
     #[test]
     fn test_extract_inline_g_value() {
         // -g*.rs: g hits at j=0, inline="*.rs", no r-stripping on value
-        let (patterns, paths, flags) = extract_pattern_path(&["aaa", "sub", "-g*.rs"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["aaa", "sub", "-g*.rs"], b"");
         assert_eq!(patterns, vec!["aaa"]);
         assert_eq!(paths, vec!["sub"]);
         assert_eq!(flags, vec!["-g", "*.rs"]);
@@ -1015,7 +1100,7 @@ mod tests {
     #[test]
     fn test_extract_inline_g_value_no_rstrip() {
         // -g*.rs: the 'r' in "*.rs" must NOT be stripped
-        let (_, _, flags) = extract_pattern_path(&["aaa", "sub", "-g*.rs"]);
+        let (_, _, flags) = extract_pattern_path(&["aaa", "sub", "-g*.rs"], b"");
         assert!(
             flags.contains(&"*.rs".to_string()),
             "r in glob value must not be stripped"
@@ -1026,7 +1111,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_glob_value() {
-        let (patterns, paths, flags) = extract_pattern_path(&["compact", "sub", "--glob", "*.md"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["compact", "sub", "--glob", "*.md"], b"");
         assert_eq!(patterns, vec!["compact"]);
         assert_eq!(paths, vec!["sub"]);
         assert_eq!(flags, vec!["--glob", "*.md"]);
@@ -1034,7 +1119,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_max_count() {
-        let (patterns, paths, flags) = extract_pattern_path(&["--max-count", "1", "fn", "file"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["--max-count", "1", "fn", "file"], b"");
         assert_eq!(patterns, vec!["fn"]);
         assert_eq!(paths, vec!["file"]);
         assert_eq!(flags, vec!["--max-count", "1"]);
@@ -1043,7 +1128,7 @@ mod tests {
     #[test]
     fn test_extract_short_type() {
         // -t rust: type filter, value must not become pattern
-        let (patterns, paths, flags) = extract_pattern_path(&["-t", "rust", "fn", "src"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["-t", "rust", "fn", "src"], b"");
         assert_eq!(patterns, vec!["fn"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-t", "rust"]);
@@ -1052,7 +1137,7 @@ mod tests {
     #[test]
     fn test_extract_short_max_depth() {
         // -d 3: max-depth, value must not become pattern
-        let (patterns, paths, flags) = extract_pattern_path(&["-d", "3", "foo", "src"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["-d", "3", "foo", "src"], b"");
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-d", "3"]);
@@ -1061,7 +1146,7 @@ mod tests {
     #[test]
     fn test_extract_short_max_columns() {
         // -M 120: max-columns, value must not become pattern
-        let (patterns, paths, flags) = extract_pattern_path(&["-M", "120", "foo", "src"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["-M", "120", "foo", "src"], b"");
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["-M", "120"]);
@@ -1070,7 +1155,7 @@ mod tests {
     #[test]
     fn test_extract_long_regexp() {
         // --regexp is the long form of -e; value goes to patterns
-        let (patterns, paths, flags) = extract_pattern_path(&["--regexp", "fn run", "src"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["--regexp", "fn run", "src"], b"");
         assert_eq!(patterns, vec!["fn run"]);
         assert_eq!(paths, vec!["src"]);
         assert!(flags.is_empty());
@@ -1079,7 +1164,7 @@ mod tests {
     #[test]
     fn test_extract_long_regexp_multi() {
         // --regexp can be combined with -e
-        let (patterns, paths, _) = extract_pattern_path(&["--regexp", "foo", "-e", "bar", "src"]);
+        let (patterns, paths, _) = extract_pattern_path(&["--regexp", "foo", "-e", "bar", "src"], b"");
         assert_eq!(patterns, vec!["foo", "bar"]);
         assert_eq!(paths, vec!["src"]);
     }
@@ -1087,7 +1172,7 @@ mod tests {
     #[test]
     fn test_extract_long_ignore_file() {
         let (patterns, paths, flags) =
-            extract_pattern_path(&["--ignore-file", ".myignore", "foo", "src"]);
+            extract_pattern_path(&["--ignore-file", ".myignore", "foo", "src"], b"");
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--ignore-file", ".myignore"]);
@@ -1095,7 +1180,7 @@ mod tests {
 
     #[test]
     fn test_extract_long_engine() {
-        let (patterns, paths, flags) = extract_pattern_path(&["--engine", "pcre2", "foo", "src"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["--engine", "pcre2", "foo", "src"], b"");
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--engine", "pcre2"]);
@@ -1104,7 +1189,7 @@ mod tests {
     #[test]
     fn test_extract_long_type_clear() {
         let (patterns, paths, flags) =
-            extract_pattern_path(&["--type-clear", "rust", "foo", "src"]);
+            extract_pattern_path(&["--type-clear", "rust", "foo", "src"], b"");
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--type-clear", "rust"]);
@@ -1113,7 +1198,7 @@ mod tests {
     #[test]
     fn test_extract_long_path_separator() {
         let (patterns, paths, flags) =
-            extract_pattern_path(&["--path-separator", "/", "foo", "src"]);
+            extract_pattern_path(&["--path-separator", "/", "foo", "src"], b"");
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--path-separator", "/"]);
@@ -1122,7 +1207,7 @@ mod tests {
     #[test]
     fn test_extract_long_flag_inline_eq_passthrough() {
         // --glob=*.rs is one token (inline =): passes through as-is, not consumed as pair
-        let (patterns, paths, flags) = extract_pattern_path(&["foo", "src", "--glob=*.rs"]);
+        let (patterns, paths, flags) = extract_pattern_path(&["foo", "src", "--glob=*.rs"], b"");
         assert_eq!(patterns, vec!["foo"]);
         assert_eq!(paths, vec!["src"]);
         assert_eq!(flags, vec!["--glob=*.rs"]);
