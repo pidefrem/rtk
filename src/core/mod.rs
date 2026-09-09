@@ -8,9 +8,11 @@ pub mod filter;
 pub mod guard;
 #[cfg(feature = "pty")]
 pub mod pty_capture;
+pub mod retriever;
 pub mod runner;
 pub mod stream;
 pub mod tee;
+pub mod tee_file;
 pub mod telemetry;
 pub mod telemetry_cmd;
 pub mod toml_filter;
